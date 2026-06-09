@@ -1,0 +1,7 @@
+-- Запустите в phpMyAdmin
+
+ALTER TABLE `payments`
+  ADD COLUMN IF NOT EXISTS `approved_by_id` INT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS `approved_by_name` VARCHAR(255) DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS `contact_b24_id` INT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS `contact_name` VARCHAR(255) DEFAULT NULL;

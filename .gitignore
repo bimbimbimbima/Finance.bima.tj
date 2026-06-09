@@ -1,0 +1,16 @@
+.env
+.env.*
+config.php
+config.local.php
+config.dev.php
+config.stage.php
+logs/
+tmp/
+uploads/
+backups/
+*.sql
+!sql/*.sql
+vendor/
+node_modules/
+.DS_Store
+Thumbs.db

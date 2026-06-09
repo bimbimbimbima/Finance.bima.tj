@@ -1,0 +1,18 @@
+Options -Indexes
+ServerSignature Off
+
+<IfModule mod_headers.c>
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+  Header always set Content-Security-Policy "frame-ancestors https://bima.bitrix24.ru https://*.bitrix24.ru https://*.bitrix24.com https://*.bitrix24.eu https://*.bitrix24.kz https://*.bitrix24.by https://*.bitrix24.de https://mobile.bitrix24.com; object-src 'none'; base-uri 'self'; upgrade-insecure-requests"
+</IfModule>
+
+<FilesMatch "(^\.env$|^config\.php$|^composer\.(json|lock)$|^README.*|^FIX_README.*|.*\.(sql|log|bak|backup|old|zip|map)$)">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Deny from all
+  </IfModule>
+</FilesMatch>

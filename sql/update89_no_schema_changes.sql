@@ -1,0 +1,3 @@
+-- v89: изменений структуры БД нет.
+-- Если колонка для дополнительных файлов не применялась ранее, выполните:
+-- ALTER TABLE `approval_requests` ADD COLUMN `attachments_json` MEDIUMTEXT NULL;

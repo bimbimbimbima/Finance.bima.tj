@@ -1,0 +1,757 @@
+<?php
+class Payment {
+
+    private static function hasColumn($column, $table = 'payments') {
+        static $cache = [];
+        $key = $table . '.' . $column;
+        if (!array_key_exists($key, $cache)) {
+            try {
+                DB::fetchOne("SELECT `{$column}` FROM `{$table}` LIMIT 1");
+                $cache[$key] = true;
+            } catch (Throwable $e) {
+                $cache[$key] = false;
+            }
+        }
+        return $cache[$key];
+    }
+
+    public static function hasPaymentColumn($column) {
+        return self::hasColumn($column, 'payments');
+    }
+
+    public static function hasImportLogColumn() {
+        return self::hasColumn('import_log_id', 'payments');
+    }
+
+    private static function amountSql($alias = '') {
+        $p = $alias ? $alias . '.' : '';
+        // amount_tjs — замороженная сумма на дату операции. Изменение текущего курса валюты
+        // не должно пересчитывать прошлые отчёты. Если старые записи ещё без amount_tjs,
+        // используем сохранённый в самой операции exchange_rate, а не текущий курс из справочника.
+        if (self::hasColumn('amount_tjs')) {
+            if (self::hasColumn('exchange_rate')) {
+                return "COALESCE(NULLIF({$p}amount_tjs,0), {$p}amount * COALESCE(NULLIF({$p}exchange_rate,0),1), {$p}amount)";
+            }
+            return "COALESCE(NULLIF({$p}amount_tjs,0), {$p}amount)";
+        }
+        return "{$p}amount";
+    }
+
+    private static function effectiveStatusSql($alias = '') {
+        $p = $alias ? $alias . '.' : '';
+        $s = "LOWER(TRIM(COALESCE({$p}status,'')))";
+        // Учитываем новые и старые значения статусов, включая русские подписи из ранних импортов.
+        return "({$p}status IS NULL OR TRIM(COALESCE({$p}status,''))='' OR {$s} IN ('approved','paid','подтверждено','выплачено','оплачено'))";
+    }
+
+    public static function isEffectiveStatus($status) {
+        $s = mb_strtolower(trim((string)$status));
+        return $s === '' || in_array($s, ['approved','paid','подтверждено','выплачено','оплачено'], true);
+    }
+
+    public static function normalizeStatus($status) {
+        $s = mb_strtolower(trim((string)$status));
+        if ($s === '' || in_array($s, ['approved','подтверждено','confirm','confirmed'], true)) return 'approved';
+        if (in_array($s, ['pending','на согласовании','согласование'], true)) return 'pending';
+        if (in_array($s, ['paid','выплачено','оплачено'], true)) return 'paid';
+        if (in_array($s, ['rejected','отклонено','отклонён','отклонен'], true)) return 'rejected';
+        return in_array($s, ['approved','pending','paid','rejected'], true) ? $s : 'approved';
+    }
+
+    private static function effectiveTypeSql($alias = '') {
+        $p = $alias ? $alias . '.' : '';
+        if (!self::hasColumn('operation_type')) {
+            return "{$p}type";
+        }
+        return "CASE
+            WHEN {$p}type='income' OR {$p}operation_type IN ('income','topup') THEN 'income'
+            WHEN {$p}type='expense' OR {$p}operation_type IN ('expense','transfer') THEN 'expense'
+            ELSE {$p}type
+        END";
+    }
+
+    private static function applyAllowedAccounts(&$where, &$params, $allowedAccountIds, $alias = 'p') {
+        // null = без ограничения (руководитель/админ); [] = запретить всё.
+        if (!is_array($allowedAccountIds)) return;
+        $allowed = array_values(array_unique(array_map('intval', $allowedAccountIds)));
+        if (in_array(0, $allowed, true)) return; // 0 = все кассы.
+        $allowed = array_values(array_filter($allowed, static fn($id) => $id > 0));
+        if (empty($allowed)) {
+            $where[] = '1=0';
+            return;
+        }
+        $prefix = $alias ? $alias . '.' : '';
+        $where[] = $prefix . 'account_id IN (' . implode(',', array_fill(0, count($allowed), '?')) . ')';
+        foreach ($allowed as $id) $params[] = $id;
+    }
+
+    private static function normalizeText($value) {
+        $value = trim((string)$value);
+        return preg_replace('/\s+/u', ' ', $value);
+    }
+
+    private static function extractCodeFromRow($row) {
+        if (isset($row['operation_code']) && trim((string)$row['operation_code']) !== '') {
+            return trim((string)$row['operation_code']);
+        }
+        $text = (string)($row['category_name'] ?? $row['name'] ?? $row['operation_type_name'] ?? '');
+        if (preg_match('/^\s*(\d{3,5})\s*[-–—]/u', $text, $m)) {
+            return $m[1];
+        }
+        return '';
+    }
+
+    private static function cleanCategoryName($name) {
+        $name = self::normalizeText($name);
+        $name = preg_replace('/^\s*\d{3,5}\s*[-–—]\s*/u', '', $name);
+        return self::normalizeText($name ?: 'Без категории');
+    }
+
+    private static function categoryGroupRules() {
+        // Основные группировки по рабочему плану. Их можно расширять без изменения БД.
+        return [
+            'Аренда' => ['1260','1261','1262','1263','1264'],
+            'Телекоммуникации, услуги связи' => ['1300','1301','1303','1304','1305','1306'],
+            'Хозяйственные расходы' => ['1280','1281','1282','1283','1284','1285','1286','1287'],
+            'Реклама' => ['1101','1102','1103','1104','1105','1106','1120','1121','1122','1123','1140','1143'],
+            'Зарплата и персонал' => ['1200','1202','1203','1210','12100','1212','12120','1213','1214','12140','1221','1222','1224','1226','1227'],
+            'Командировки' => ['1240'],
+            'Автопарк и транспорт' => ['1320','13200','1321','1322','13220','1343'],
+            'ИТ и оборудование' => ['1340','1341','1342','1344','1345','1346','1360','1361','1362','1363'],
+            'Профессиональные услуги' => ['1380','1381','1382','1383','1384','1385','1386','1387'],
+            'Налоги, комиссии и сборы' => ['1400','1421','1422','1426','1427','1428','1430','1431'],
+            'Безопасность' => ['1423','1424'],
+            'Инвестиции и акционерные операции' => ['1441','1443','1444','1451','1452','1454'],
+            'Прочие расходы' => ['100','1250','1425','1429','1450','1453','1457'],
+        ];
+    }
+
+    private static function groupNameForCategory($row) {
+        $code = self::extractCodeFromRow($row);
+        $rawName = $row['category_name'] ?? $row['name'] ?? $row['operation_type_name'] ?? 'Без категории';
+        $clean = self::cleanCategoryName($rawName);
+
+        if ($code !== '') {
+            foreach (self::categoryGroupRules() as $group => $codes) {
+                if (in_array($code, $codes, true)) return $group;
+            }
+            // Если правила нет, группируем по первой части кода: 12xx, 13xx и т.д.
+            if (strlen($code) >= 2) return 'Группа ' . substr($code, 0, 2) . 'xx';
+        }
+        return $clean ?: 'Без категории';
+    }
+
+
+
+    private static function ensureHistoryTable() {
+        static $done = false;
+        if ($done) return;
+        $done = true;
+        try {
+            DB::execute("CREATE TABLE IF NOT EXISTS payment_history (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                portal VARCHAR(255) NOT NULL,
+                payment_id INT DEFAULT NULL,
+                action VARCHAR(50) NOT NULL,
+                actor_id INT DEFAULT NULL,
+                actor_name VARCHAR(255) DEFAULT NULL,
+                before_json MEDIUMTEXT NULL,
+                after_json MEDIUMTEXT NULL,
+                comment TEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_payment_history_payment (portal(100), payment_id, created_at),
+                KEY idx_payment_history_portal (portal(100), created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        } catch (Throwable $e) {
+            app_log('Payment history table create failed: '.$e->getMessage());
+        }
+    }
+
+    private static function actorName($actor = null) {
+        if (is_array($actor)) {
+            $name = trim((string)($actor['name'] ?? ''));
+            if ($name !== '') return $name;
+        }
+        return 'Система';
+    }
+
+    private static function actorId($actor = null) {
+        if (is_array($actor) && isset($actor['id'])) return (int)$actor['id'];
+        return null;
+    }
+
+    private static function logHistory($portal, $paymentId, $action, $actor = null, $before = null, $after = null, $comment = '') {
+        try {
+            self::ensureHistoryTable();
+            DB::insert(
+                "INSERT INTO payment_history (portal,payment_id,action,actor_id,actor_name,before_json,after_json,comment,created_at)
+                 VALUES (?,?,?,?,?,?,?,?,NOW())",
+                [
+                    $portal,
+                    $paymentId ? (int)$paymentId : null,
+                    $action,
+                    self::actorId($actor),
+                    self::actorName($actor),
+                    $before !== null ? json_encode($before, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) : null,
+                    $after !== null ? json_encode($after, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) : null,
+                    $comment ?: null,
+                ]
+            );
+        } catch (Throwable $e) {
+            app_log('Payment history log failed: '.$e->getMessage());
+        }
+    }
+
+    public static function historyActionLabel($action) {
+        $map = [
+            'created' => 'Добавление операции',
+            'updated' => 'Изменение операции',
+            'deleted' => 'Удаление операции',
+            'status'  => 'Изменение статуса',
+        ];
+        return $map[$action] ?? $action;
+    }
+
+    public static function historyRows($portal, $paymentIds = [], $limit = 80) {
+        try {
+            self::ensureHistoryTable();
+            $where = ["portal=?"];
+            $params = [$portal];
+            $ids = array_values(array_unique(array_filter(array_map('intval', (array)$paymentIds), static fn($v)=>$v>0)));
+            if (!empty($ids)) {
+                $where[] = "(payment_id IN (" . implode(',', array_fill(0, count($ids), '?')) . ") OR payment_id IS NULL)";
+                foreach ($ids as $id) $params[] = $id;
+            }
+            $limit = max(10, min(300, (int)$limit));
+            return DB::fetchAll("SELECT * FROM payment_history WHERE ".implode(' AND ', $where)." ORDER BY created_at DESC, id DESC LIMIT {$limit}", $params);
+        } catch (Throwable $e) {
+            app_log('Payment history rows failed: '.$e->getMessage());
+            return [];
+        }
+    }
+
+    public static function add($portal, $data, $allowedAccountIds = null, $actor = null) {
+        $opType = $data['operation_type'] ?? $data['type'] ?? 'expense';
+        if (!in_array($opType, ['income','expense','transfer','topup'], true)) {
+            $opType = 'expense';
+        }
+
+        $status = $data['status'] ?? 'approved';
+        if (!in_array($status, ['pending','approved','rejected','paid'], true)) {
+            $status = 'approved';
+        }
+
+        // Проверка баланса намеренно отключена: расход/перевод может уводить кассу в минус.
+        $type = in_array($opType, ['income', 'topup'], true) ? 'income' : 'expense';
+
+        $amount = abs((float)($data['amount'] ?? 0));
+        if ($amount <= 0) {
+            return ['error' => 'Введите сумму больше 0'];
+        }
+
+        $exchangeRate = (float)($data['exchange_rate'] ?? 1);
+        if ($exchangeRate <= 0) $exchangeRate = 1;
+        $amountTjs = abs((float)($data['amount_tjs'] ?? 0));
+        if ($amountTjs <= 0) $amountTjs = $amount * $exchangeRate;
+
+        $accountId  = !empty($data['account_id']) ? (int)$data['account_id'] : null;
+        $transferTo = !empty($data['transfer_to']) ? (int)$data['transfer_to'] : null;
+
+        if (!$accountId) {
+            return ['error' => 'Выберите банк/кассу'];
+        }
+        if ($opType === 'transfer' && !$transferTo) {
+            return ['error' => 'Выберите кассу-получатель'];
+        }
+
+        // Синхронизация "код ↔ статья" на сервере, чтобы правило работало даже без JS.
+        $categoryId = !empty($data['category_id']) ? (int)$data['category_id'] : null;
+        $operationCode = trim((string)($data['operation_code'] ?? ''));
+        $operationTypeName = trim((string)($data['operation_type_name'] ?? ''));
+
+        try {
+            if ($categoryId) {
+                $cat = DB::fetchOne("SELECT id,name,type FROM categories WHERE id=? AND portal=? LIMIT 1", [$categoryId, $portal]);
+                if ($cat) {
+                    if ($operationCode === '' && preg_match('/^\s*(\d{2,6})\s*[-–—]/u', (string)$cat['name'], $m)) {
+                        $operationCode = $m[1];
+                    }
+                    if ($operationTypeName === '') {
+                        $operationTypeName = self::cleanCategoryName($cat['name']);
+                    }
+                }
+            } elseif ($operationCode !== '') {
+                // Если код введён вручную, автоматически ищем статью с таким кодом по текущему типу операции.
+                $catRows = DB::fetchAll("SELECT id,name FROM categories WHERE portal=? AND type=? ORDER BY name", [$portal, $type]);
+                foreach ($catRows as $cat) {
+                    if (preg_match('/^\s*(\d{2,6})\s*[-–—]/u', (string)$cat['name'], $m) && $m[1] === $operationCode) {
+                        $categoryId = (int)$cat['id'];
+                        if ($operationTypeName === '') $operationTypeName = self::cleanCategoryName($cat['name']);
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable $e) { app_log('Payment::add category/code sync failed: '.$e->getMessage()); }
+
+        $data['category_id'] = $categoryId ?: null;
+        $data['operation_code'] = ($operationCode !== '') ? $operationCode : null;
+        $data['operation_type_name'] = ($operationTypeName !== '') ? $operationTypeName : null;
+
+        // Строгая проверка прав: обычный сотрудник может создавать операции только по своим кассам.
+        if (is_array($allowedAccountIds) && !in_array(0, array_map('intval', $allowedAccountIds), true)) {
+            $allowed = array_values(array_unique(array_filter(array_map('intval', $allowedAccountIds), static fn($id) => $id > 0)));
+            if (!in_array($accountId, $allowed, true)) {
+                return ['error' => 'Нет права добавлять операции по выбранной кассе'];
+            }
+            if ($opType === 'transfer' && !in_array($transferTo, $allowed, true)) {
+                return ['error' => 'Нет права переводить средства в выбранную кассу'];
+            }
+        }
+
+        $hasNewCols = self::hasColumn('currency');
+
+        $createdId = DB::transaction(function() use ($portal, $data, $hasNewCols, $type, $opType, $status, $amount, $amountTjs, $exchangeRate, $accountId, $transferTo) {
+            if ($hasNewCols) {
+                $id = DB::insert(
+                    "INSERT INTO payments (portal,type,operation_type,date,amount,account_id,category_id,
+                      company,recipient_id,recipient_name,comment,description,source,status,
+                      transfer_to,currency,exchange_rate,amount_tjs,transaction_link,
+                      operation_code,operation_type_name,department,sub_department,region,account_type)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        $portal, $type, $opType, $data['date'], $amount,
+                        $accountId,
+                        !empty($data['category_id']) ? (int)$data['category_id'] : null,
+                        !empty($data['company']) ? $data['company'] : null,
+                        !empty($data['recipient_id']) ? (int)$data['recipient_id'] : null,
+                        !empty($data['recipient_name']) ? $data['recipient_name'] : (!empty($data['company']) ? $data['company'] : null),
+                        !empty($data['comment']) ? $data['comment'] : null,
+                        !empty($data['description']) ? $data['description'] : (!empty($data['comment']) ? $data['comment'] : null),
+                        $data['source'] ?? 'manual',
+                        $status,
+                        $transferTo,
+                        $data['currency'] ?? 'TJS',
+                        $exchangeRate,
+                        $amountTjs,
+                        !empty($data['transaction_link']) ? $data['transaction_link'] : null,
+                        !empty($data['operation_code']) ? (int)$data['operation_code'] : null,
+                        !empty($data['operation_type_name']) ? $data['operation_type_name'] : null,
+                        !empty($data['department']) ? $data['department'] : null,
+                        !empty($data['sub_department']) ? $data['sub_department'] : null,
+                        (int)($data['region'] ?? 0),
+                        $data['account_type'] ?? 'cash',
+                    ]
+                );
+            } else {
+                $id = DB::insert(
+                    "INSERT INTO payments (portal,type,operation_type,date,amount,account_id,category_id,
+                      company,comment,source,status,transfer_to)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        $portal, $type, $opType, $data['date'], $amount,
+                        $accountId,
+                        !empty($data['category_id']) ? (int)$data['category_id'] : null,
+                        $data['company'] ?? ($data['recipient_name'] ?? null),
+                        $data['description'] ?? $data['comment'] ?? null,
+                        $data['source'] ?? 'manual',
+                        $status,
+                        $transferTo,
+                    ]
+                );
+            }
+
+            // Перевод: расход из первой кассы + приход во вторую кассу.
+            if ($id && self::hasColumn('exchange_rate_date')) {
+                try {
+                    DB::execute("UPDATE payments SET exchange_rate_date=? WHERE id=? AND portal=?", [$data['exchange_rate_date'] ?? $data['date'], $id, $portal]);
+                } catch (Throwable $e) { app_log('Payment::add exchange_rate_date update failed: '.$e->getMessage()); }
+            }
+
+            if ($opType === 'transfer' && $transferTo && $id) {
+                $comment = 'Перевод из кассы #' . $accountId;
+                $desc = !empty($data['description']) ? $data['description'] : $comment;
+                if ($hasNewCols) {
+                    DB::insert(
+                        "INSERT INTO payments (portal,type,operation_type,date,amount,account_id,
+                          comment,description,source,status,currency,exchange_rate,amount_tjs,transfer_to)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        [$portal,'income','transfer',$data['date'],$amount,$transferTo,
+                         $comment,$desc,'manual',$status,
+                         $data['currency']??'TJS',$exchangeRate,$amountTjs,$accountId]
+                    );
+                } else {
+                    DB::insert(
+                        "INSERT INTO payments (portal,type,operation_type,date,amount,account_id,comment,source,status,transfer_to)
+                         VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        [$portal,'income','transfer',$data['date'],$amount,$transferTo,$comment,'manual',$status,$accountId]
+                    );
+                }
+            }
+            return $id;
+        });
+        if ($createdId) {
+            self::logHistory($portal, $createdId, 'created', $actor, null, [
+                'date'=>$data['date'] ?? null,
+                'type'=>$type,
+                'operation_type'=>$opType,
+                'amount'=>$amount,
+                'amount_tjs'=>$amountTjs,
+                'currency'=>$data['currency'] ?? 'TJS',
+                'account_id'=>$accountId,
+                'description'=>$data['description'] ?? ($data['comment'] ?? ''),
+                'source'=>$data['source'] ?? 'manual',
+            ], 'Операция добавлена');
+        }
+        return $createdId;
+    }
+
+
+    public static function getAccountBalance($portal, $accountId) {
+        $amount = self::amountSql();
+        $typeExpr = self::effectiveTypeSql();
+        $initial = self::hasColumn('balance','accounts') ? "COALESCE((SELECT balance FROM accounts WHERE id=? AND portal=? LIMIT 1),0) +" : "";
+        $params = self::hasColumn('balance','accounts') ? [$accountId, $portal, $portal, $accountId] : [$portal, $accountId];
+        $row = DB::fetchOne(
+            "SELECT {$initial}
+                COALESCE(SUM(CASE WHEN {$typeExpr}='income'  AND ".self::effectiveStatusSql()." THEN {$amount} ELSE 0 END),0) -
+                COALESCE(SUM(CASE WHEN {$typeExpr}='expense' AND ".self::effectiveStatusSql()." THEN {$amount} ELSE 0 END),0) as balance
+             FROM payments
+             WHERE portal=? AND account_id=?",
+            $params
+        );
+        return (float)($row['balance'] ?? 0);
+    }
+
+    public static function delete($portal, $id, $allowedAccountIds = null, $actor = null) {
+        $where = ["id=?", "portal=?"];
+        $params = [(int)$id, $portal];
+        self::applyAllowedAccounts($where, $params, $allowedAccountIds, '');
+        $row = DB::fetchOne("SELECT * FROM payments WHERE " . implode(' AND ', $where) . " LIMIT 1", $params);
+        if (!$row) return 0;
+        $deleted = DB::execute("DELETE FROM payments WHERE " . implode(' AND ', $where), $params);
+        if ($deleted) self::logHistory($portal, $id, 'deleted', $actor, $row, null, 'Операция удалена');
+        return $deleted;
+    }
+
+
+    public static function updateStatus($portal, $id, $status, $approvedById = null, $approvedByName = null, $allowedAccountIds = null, $actor = null) {
+        $id = (int)$id;
+        $status = self::normalizeStatus($status);
+        $where = ["id=?", "portal=?"];
+        $paramsWhere = [$id, $portal];
+        self::applyAllowedAccounts($where, $paramsWhere, $allowedAccountIds, '');
+
+        // Сначала проверяем существование записи и доступ к кассе. Это важно, потому что
+        // MySQL rowCount может вернуть 0, если статус уже был таким же.
+        $row = DB::fetchOne("SELECT * FROM payments WHERE " . implode(' AND ', $where) . " LIMIT 1", $paramsWhere);
+        if (!$row) return 0;
+        $oldStatus = $row['status'] ?? '';
+
+        try {
+            DB::execute(
+                "UPDATE payments SET status=?, approved_by_id=?, approved_by_name=? WHERE " . implode(' AND ', $where),
+                array_merge([$status, $approvedById, $approvedByName], $paramsWhere)
+            );
+        } catch (Throwable $e) {
+            DB::execute(
+                "UPDATE payments SET status=? WHERE " . implode(' AND ', $where),
+                array_merge([$status], $paramsWhere)
+            );
+        }
+        if ((string)$oldStatus !== (string)$status) {
+            self::logHistory($portal, $id, 'status', $actor ?: ['id'=>$approvedById,'name'=>$approvedByName], ['status'=>$oldStatus], ['status'=>$status], 'Статус изменён');
+        }
+        return 1;
+    }
+
+
+    private static function buildListWhere($portal, $filter = []) {
+        $where  = ["p.portal = ?"];
+        $params = [$portal];
+        $typeExpr = self::effectiveTypeSql('p');
+        if (!empty($filter['type']))        { $where[] = "{$typeExpr}=?";       $params[] = $filter['type']; }
+        if (!empty($filter['date_from']))   { $where[] = "p.date>=?";           $params[] = $filter['date_from']; }
+        if (!empty($filter['date_to']))     { $where[] = "p.date<=?";           $params[] = $filter['date_to']; }
+        if (!empty($filter['account_id']))  { $where[] = "p.account_id=?";      $params[] = (int)$filter['account_id']; }
+        if (!empty($filter['exchange_rate_date']) && self::hasColumn('exchange_rate_date')) { $where[] = "p.exchange_rate_date=?"; $params[] = $filter['exchange_rate_date']; }
+        if (!empty($filter['category_id'])) { $where[] = "p.category_id=?";     $params[] = $filter['category_id']; }
+        if (!empty($filter['status']))      { $where[] = "LOWER(TRIM(p.status))=?"; $params[] = mb_strtolower(trim($filter['status'])); }
+        if (array_key_exists('allowed_account_ids', $filter)) self::applyAllowedAccounts($where, $params, $filter['allowed_account_ids'], 'p');
+        return [$where, $params, $typeExpr];
+    }
+
+    public static function count($portal, $filter = []) {
+        [$where, $params] = self::buildListWhere($portal, $filter);
+        $row = DB::fetchOne("SELECT COUNT(*) AS c FROM payments p WHERE " . implode(' AND ', $where), $params);
+        return (int)($row['c'] ?? 0);
+    }
+
+    public static function list($portal, $filter = []) {
+        [$where, $params, $typeExpr] = self::buildListWhere($portal, $filter);
+
+        $amountExpr = self::amountSql('p');
+        $orderDir = (!empty($filter['order']) && strtolower((string)$filter['order']) === 'asc') ? 'ASC' : 'DESC';
+        $limit = isset($filter['limit']) ? max(1, min(1000, (int)$filter['limit'])) : 0;
+        $offset = isset($filter['offset']) ? max(0, (int)$filter['offset']) : 0;
+
+        $sql = "SELECT p.*, {$amountExpr} as amount_effective, {$typeExpr} as effective_type, c.name as category_name,
+                       a.name as account_name, a2.name as transfer_to_name
+                FROM payments p
+                LEFT JOIN categories c  ON c.id=p.category_id
+                LEFT JOIN accounts   a  ON a.id=p.account_id
+                LEFT JOIN accounts   a2 ON a2.id=p.transfer_to
+                WHERE ".implode(' AND ',$where)."
+                ORDER BY p.date {$orderDir}, p.id {$orderDir}";
+        if ($limit > 0) {
+            $sql .= " LIMIT " . (int)$limit . " OFFSET " . (int)$offset;
+        }
+
+        return DB::fetchAll($sql, $params);
+    }
+
+
+    public static function totals($portal, $dateFrom, $dateTo, $allowedAccountIds = null) {
+        $amount = self::amountSql('p');
+        $typeExpr = self::effectiveTypeSql('p');
+        $where = ["p.portal=?", "p.date BETWEEN ? AND ?", self::effectiveStatusSql('p')];
+        $params = [$portal, $dateFrom, $dateTo];
+        self::applyAllowedAccounts($where, $params, $allowedAccountIds, 'p');
+        $rows = DB::fetchAll(
+            "SELECT {$typeExpr} as t, SUM({$amount}) as total FROM payments p
+             WHERE " . implode(' AND ', $where) . "
+             GROUP BY t",
+            $params
+        );
+        $result = ['income'=>0,'expense'=>0];
+        foreach ($rows as $r) {
+            if (isset($result[$r['t']])) $result[$r['t']] = (float)$r['total'];
+        }
+        $result['profit'] = $result['income'] - $result['expense'];
+        return $result;
+    }
+
+
+    public static function chartByMonth($portal, $year, $allowedAccountIds = null) {
+        $amount = self::amountSql('p');
+        $typeExpr = self::effectiveTypeSql('p');
+        $where = ["p.portal=?", "YEAR(p.date)=?", self::effectiveStatusSql('p')];
+        $params = [$portal, $year];
+        self::applyAllowedAccounts($where, $params, $allowedAccountIds, 'p');
+        return DB::fetchAll(
+            "SELECT MONTH(p.date) as month, {$typeExpr} as type, SUM({$amount}) as total
+             FROM payments p
+             WHERE " . implode(' AND ', $where) . "
+             GROUP BY MONTH(p.date), type ORDER BY month",
+            $params
+        );
+    }
+
+
+    public static function byCategory($portal, $dateFrom, $dateTo, $type='expense', $allowedAccountIds = null) {
+        $groups = self::categoryGroups($portal, $dateFrom, $dateTo, $type, $allowedAccountIds);
+        return array_map(static function($g) {
+            return ['name' => $g['name'], 'total' => $g['total'], 'children' => $g['children']];
+        }, $groups);
+    }
+
+
+    public static function byCategoryDetailed($portal, $dateFrom, $dateTo, $type='expense', $allowedAccountIds = null) {
+        $amount = self::amountSql('p');
+        $typeExpr = self::effectiveTypeSql('p');
+        $where = ["p.portal=?", "{$typeExpr}=?", "p.date BETWEEN ? AND ?", self::effectiveStatusSql('p')];
+        $params = [$portal, $type, $dateFrom, $dateTo];
+        self::applyAllowedAccounts($where, $params, $allowedAccountIds, 'p');
+        return DB::fetchAll(
+            "SELECT COALESCE(c.name, NULLIF(p.operation_type_name,''), 'Без категории') as name,
+                    COALESCE(p.operation_code,'') as operation_code,
+                    SUM({$amount}) as total
+             FROM payments p
+             LEFT JOIN categories c ON c.id=p.category_id
+             WHERE " . implode(' AND ', $where) . "
+             GROUP BY COALESCE(c.name, NULLIF(p.operation_type_name,''), 'Без категории'), COALESCE(p.operation_code,'')
+             ORDER BY total DESC",
+            $params
+        );
+    }
+
+
+    public static function categoryGroups($portal, $dateFrom, $dateTo, $type='expense', $allowedAccountIds = null) {
+        $rows = self::byCategoryDetailed($portal, $dateFrom, $dateTo, $type, $allowedAccountIds);
+        $groups = [];
+        foreach ($rows as $r) {
+            $groupName = self::groupNameForCategory(['name'=>$r['name'], 'operation_code'=>$r['operation_code'] ?? '']);
+            $code = self::extractCodeFromRow(['name'=>$r['name'], 'operation_code'=>$r['operation_code'] ?? '']);
+            $childName = self::cleanCategoryName($r['name'] ?? 'Без категории');
+            if (!isset($groups[$groupName])) {
+                $groups[$groupName] = ['name'=>$groupName, 'total'=>0.0, 'children'=>[]];
+            }
+            $total = (float)($r['total'] ?? 0);
+            $groups[$groupName]['total'] += $total;
+            $groups[$groupName]['children'][] = [
+                'code' => $code,
+                'name' => $childName,
+                'raw_name' => $r['name'] ?? '',
+                'total' => $total,
+            ];
+        }
+        $groups = array_values($groups);
+        usort($groups, static fn($a,$b) => $b['total'] <=> $a['total']);
+        foreach ($groups as &$g) {
+            usort($g['children'], static function($a,$b){
+                if ($a['code'] !== '' && $b['code'] !== '') return strcmp($a['code'], $b['code']);
+                return $b['total'] <=> $a['total'];
+            });
+        }
+        unset($g);
+        return $groups;
+    }
+
+
+    public static function accountBalances($portal, $allowedAccountIds = null) {
+        $amount = self::amountSql('p');
+        $typeExpr = self::effectiveTypeSql('p');
+        $initial = self::hasColumn('balance','accounts') ? "COALESCE(a.balance,0) +" : "";
+        $where = ["a.portal=?"];
+        $params = [$portal];
+        // Фильтруем именно список счетов/касс. Обычный сотрудник видит остаток только по своим кассам.
+        if (is_array($allowedAccountIds) && !in_array(0, array_map('intval', $allowedAccountIds), true)) {
+            $allowed = array_values(array_unique(array_filter(array_map('intval', $allowedAccountIds), static fn($id) => $id > 0)));
+            if (empty($allowed)) {
+                return [];
+            }
+            $where[] = 'a.id IN (' . implode(',', array_fill(0, count($allowed), '?')) . ')';
+            foreach ($allowed as $id) $params[] = $id;
+        }
+        return DB::fetchAll(
+            "SELECT a.id,a.name,
+                {$initial}
+                COALESCE(SUM(CASE WHEN {$typeExpr}='income'  AND ".self::effectiveStatusSql('p')." THEN {$amount} ELSE 0 END),0)
+              - COALESCE(SUM(CASE WHEN {$typeExpr}='expense' AND ".self::effectiveStatusSql('p')." THEN {$amount} ELSE 0 END),0) as balance
+             FROM accounts a
+             LEFT JOIN payments p ON p.account_id=a.id AND p.portal=a.portal
+             WHERE " . implode(' AND ', $where) . "
+             GROUP BY a.id,a.name" . (self::hasColumn('balance','accounts') ? ",a.balance" : "") . " ORDER BY a.name",
+            $params
+        );
+    }
+
+
+    public static function updateFromReport($portal, $id, $data, $allowedAccountIds = null, $actor = null) {
+        $id = (int)$id;
+        if ($id <= 0) return false;
+
+        // Проверяем, что запись принадлежит порталу и доступной кассе.
+        $where = ["id=?", "portal=?"];
+        $params = [$id, $portal];
+        self::applyAllowedAccounts($where, $params, $allowedAccountIds, '');
+        $row = DB::fetchOne("SELECT * FROM payments WHERE " . implode(' AND ', $where) . " LIMIT 1", $params);
+        if (!$row) return false;
+
+        $fields = [];
+        $vals = [];
+        $allowedSimple = [
+            'date' => 'date',
+            'description' => 'description',
+            'recipient_name' => 'recipient_name',
+            'company' => 'company',
+            'transaction_link' => 'transaction_link',
+            'operation_type_name' => 'operation_type_name',
+            'department' => 'department',
+            'sub_department' => 'sub_department',
+            'currency' => 'currency',
+            'exchange_rate' => 'exchange_rate',
+            'region' => 'region',
+            'status' => 'status',
+        ];
+
+        foreach ($allowedSimple as $input => $col) {
+            if (!array_key_exists($input, $data) || !self::hasColumn($col)) continue;
+            $v = $data[$input];
+            if ($col === 'exchange_rate') $v = max(0.0001, (float)$v);
+            if ($col === 'region') $v = (int)$v;
+            if ($col === 'status') {
+                $v = self::normalizeStatus($v);
+            }
+            $fields[] = "`{$col}`=?";
+            $vals[] = $v === '' ? null : $v;
+        }
+
+        if (array_key_exists('operation_code', $data) && self::hasColumn('operation_code')) {
+            $fields[] = "operation_code=?";
+            $vals[] = ($data['operation_code'] === '' ? null : (int)$data['operation_code']);
+        }
+
+        if (array_key_exists('account_id', $data)) {
+            $newAccount = (int)$data['account_id'];
+            if ($newAccount <= 0) return ['error' => 'Выберите кассу'];
+            if (is_array($allowedAccountIds) && !in_array(0, array_map('intval', $allowedAccountIds), true)) {
+                $allowed = array_values(array_filter(array_map('intval', $allowedAccountIds), static fn($v) => $v > 0));
+                if (!in_array($newAccount, $allowed, true)) return false;
+            }
+            $fields[] = "account_id=?";
+            $vals[] = $newAccount;
+        }
+
+        if (array_key_exists('type', $data)) {
+            $t = $data['type'];
+            if (in_array($t, ['income','expense'], true)) {
+                $fields[] = "type=?";
+                $vals[] = $t;
+                if (self::hasColumn('operation_type')) {
+                    $fields[] = "operation_type=?";
+                    $vals[] = $t;
+                }
+            }
+        }
+
+        $amount = null;
+        if (array_key_exists('amount', $data)) {
+            $amount = abs((float)$data['amount']);
+            if ($amount <= 0) return ['error' => 'Сумма должна быть больше 0'];
+            $fields[] = "amount=?";
+            $vals[] = $amount;
+        }
+        if (self::hasColumn('amount_tjs')) {
+            if (array_key_exists('amount_tjs', $data) && (float)$data['amount_tjs'] > 0) {
+                $fields[] = "amount_tjs=?";
+                $vals[] = abs((float)$data['amount_tjs']);
+            } elseif ($amount !== null) {
+                $rate = array_key_exists('exchange_rate', $data) ? max(0.0001, (float)$data['exchange_rate']) : (float)($row['exchange_rate'] ?? 1);
+                $fields[] = "amount_tjs=?";
+                $vals[] = $amount * ($rate ?: 1);
+            }
+        }
+
+        if (array_key_exists('category_id', $data)) {
+            $fields[] = "category_id=?";
+            $vals[] = ((int)$data['category_id'] > 0) ? (int)$data['category_id'] : null;
+        }
+
+        if (empty($fields)) return true;
+        $vals[] = $id;
+        $vals[] = $portal;
+        DB::execute("UPDATE payments SET " . implode(',', $fields) . " WHERE id=? AND portal=?", $vals);
+        $after = DB::fetchOne("SELECT * FROM payments WHERE id=? AND portal=? LIMIT 1", [$id, $portal]);
+        self::logHistory($portal, $id, 'updated', $actor, $row, $after, 'Операция изменена из отчёта');
+        // MySQL/MariaDB returns rowCount=0 when values are the same. Since the row was already
+        // found and access was checked above, this is still a successful save.
+        return true;
+    }
+
+
+    public static function pending($portal, $allowedAccountIds = null) {
+        $where = ["p.portal=?", "LOWER(TRIM(p.status))='pending'"];
+        $params = [$portal];
+        self::applyAllowedAccounts($where, $params, $allowedAccountIds, 'p');
+        return DB::fetchAll(
+            "SELECT p.*,c.name as category_name,a.name as account_name
+             FROM payments p
+             LEFT JOIN categories c ON c.id=p.category_id
+             LEFT JOIN accounts   a ON a.id=p.account_id
+             WHERE " . implode(' AND ', $where) . "
+             ORDER BY p.date DESC",
+            $params
+        );
+    }
+
+}
