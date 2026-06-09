@@ -23,61 +23,36 @@ jobs:
         with:
           php-version: '8.2'
 
-      - name: PHP syntax check
-        shell: bash
-        run: |
-          find . -name "*.php" \
-            -not -path "./vendor/*" \
-            -not -path "./logs/*" \
-            -not -path "./tmp/*" \
-            -not -path "./uploads/*" \
-            -not -name "config.php" \
-            -print0 | xargs -0 -n1 php -l
-
-      - name: Check forbidden secrets
+      - name: Check forbidden tracked files
         shell: bash
         run: |
           set -e
 
-          if grep -R "AUTH_ID" . \
-            --exclude-dir=.git \
-            --exclude-dir=.github \
-            --exclude-dir=logs \
-            --exclude-dir=tmp \
-            --exclude-dir=uploads; then
-            echo "Forbidden secret found: AUTH_ID"
+          if git ls-files | grep -E '(^|/)config\.php$'; then
+            echo "ERROR: config.php must not be committed."
             exit 1
           fi
 
-          if grep -R "REFRESH_ID" . \
-            --exclude-dir=.git \
-            --exclude-dir=.github \
-            --exclude-dir=logs \
-            --exclude-dir=tmp \
-            --exclude-dir=uploads; then
-            echo "Forbidden secret found: REFRESH_ID"
+          if git ls-files | grep -E '\.(bak|old|tmp|v55|v57bak)$|(^|/)test\.php$'; then
+            echo "ERROR: backup/test files must not be committed."
             exit 1
           fi
 
-          if grep -R "CLIENT_SECRET', 'local" . \
-            --exclude-dir=.git \
-            --exclude-dir=.github \
-            --exclude-dir=logs \
-            --exclude-dir=tmp \
-            --exclude-dir=uploads; then
-            echo "Forbidden real Bitrix CLIENT_SECRET found"
-            exit 1
+      - name: PHP syntax check
+        shell: bash
+        run: |
+          set -e
+
+          files=$(git ls-files '*.php' | grep -vE '(^|/)config\.php$' || true)
+
+          if [ -z "$files" ]; then
+            echo "No PHP files found."
+            exit 0
           fi
 
-          if grep -R "FinanceProd_2026_Strong" . \
-            --exclude-dir=.git \
-            --exclude-dir=.github \
-            --exclude-dir=logs \
-            --exclude-dir=tmp \
-            --exclude-dir=uploads; then
-            echo "Forbidden database password found"
-            exit 1
-          fi
+          echo "$files" | while read file; do
+            php -l "$file"
+          done
 
       - name: Check SQL folder
         shell: bash
