@@ -18,20 +18,68 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+
       - name: PHP syntax check
+        shell: bash
         run: |
           find . -name "*.php" \
             -not -path "./vendor/*" \
+            -not -path "./logs/*" \
+            -not -path "./tmp/*" \
+            -not -path "./uploads/*" \
             -not -name "config.php" \
             -print0 | xargs -0 -n1 php -l
 
       - name: Check forbidden secrets
+        shell: bash
         run: |
-          ! grep -R "AUTH_ID" . --exclude-dir=.git || exit 1
-          ! grep -R "REFRESH_ID" . --exclude-dir=.git || exit 1
-          ! grep -R "CLIENT_SECRET', 'local" . --exclude-dir=.git || exit 1
-          ! grep -R "FinanceProd_2026_Strong" . --exclude-dir=.git || exit 1
+          set -e
+
+          if grep -R "AUTH_ID" . \
+            --exclude-dir=.git \
+            --exclude-dir=.github \
+            --exclude-dir=logs \
+            --exclude-dir=tmp \
+            --exclude-dir=uploads; then
+            echo "Forbidden secret found: AUTH_ID"
+            exit 1
+          fi
+
+          if grep -R "REFRESH_ID" . \
+            --exclude-dir=.git \
+            --exclude-dir=.github \
+            --exclude-dir=logs \
+            --exclude-dir=tmp \
+            --exclude-dir=uploads; then
+            echo "Forbidden secret found: REFRESH_ID"
+            exit 1
+          fi
+
+          if grep -R "CLIENT_SECRET', 'local" . \
+            --exclude-dir=.git \
+            --exclude-dir=.github \
+            --exclude-dir=logs \
+            --exclude-dir=tmp \
+            --exclude-dir=uploads; then
+            echo "Forbidden real Bitrix CLIENT_SECRET found"
+            exit 1
+          fi
+
+          if grep -R "FinanceProd_2026_Strong" . \
+            --exclude-dir=.git \
+            --exclude-dir=.github \
+            --exclude-dir=logs \
+            --exclude-dir=tmp \
+            --exclude-dir=uploads; then
+            echo "Forbidden database password found"
+            exit 1
+          fi
 
       - name: Check SQL folder
+        shell: bash
         run: |
           test -d sql
