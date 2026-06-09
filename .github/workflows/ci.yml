@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+      - stage
+  pull_request:
+    branches:
+      - dev
+      - stage
+
+jobs:
+  php-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: PHP syntax check
+        run: |
+          find . -name "*.php" \
+            -not -path "./vendor/*" \
+            -not -name "config.php" \
+            -print0 | xargs -0 -n1 php -l
+
+      - name: Check forbidden secrets
+        run: |
+          ! grep -R "AUTH_ID" . --exclude-dir=.git || exit 1
+          ! grep -R "REFRESH_ID" . --exclude-dir=.git || exit 1
+          ! grep -R "CLIENT_SECRET', 'local" . --exclude-dir=.git || exit 1
+          ! grep -R "FinanceProd_2026_Strong" . --exclude-dir=.git || exit 1
+
+      - name: Check SQL folder
+        run: |
+          test -d sql
